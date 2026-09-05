@@ -13,15 +13,14 @@ FONT=app/src/main/assets/fonts/Vazirmatn-Medium.ttf
 for u in \
   "https://raw.githubusercontent.com/google/fonts/main/ofl/vazirmatn/Vazirmatn%5Bwght%5D.ttf" \
   "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/vazirmatn/Vazirmatn%5Bwght%5D.ttf" \
-  "https://cdn.jsdelivr.net/npm/vazirmatn@33.0.3/fonts/ttf/Vazirmatn-Medium.ttf" \
-  "https://cdn.jsdelivr.net/npm/vazirmatn@33.0.3/fonts/webfonts/Vazirmatn-Medium.woff2" ; do
+  "https://cdn.jsdelivr.net/npm/vazirmatn@33.0.3/fonts/ttf/Vazirmatn-Medium.ttf" ; do
   if curl -fsSL "$u" -o "$FONT" 2>/dev/null && [ "$(stat -c%s "$FONT")" -gt 20000 ]; then
     echo "    font from $u"
     break
   fi
   rm -f "$FONT"
 done
-[ -f "$FONT" ] || echo "    !! font not downloaded, app will fall back to sans-serif"
+[ -f "$FONT" ] || echo "    !! font not downloaded, app falls back to sans-serif"
 
 # ------------------------------------------------------------------ gradle
 cat > settings.gradle.kts <<'EOF_SETTINGS'
@@ -73,8 +72,8 @@ android {
         applicationId = "ir.livesub"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
     }
 
     buildTypes {
@@ -92,6 +91,7 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation(platform("androidx.compose:compose-bom:2024.10.01"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
@@ -189,6 +189,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -222,9 +223,18 @@ object Bus {
 
 // ======================================================= تنظیمات
 
+/** سه حالت آماده برای معاوضهٔ تأخیر با کیفیت. */
+data class LatencyPreset(val label: String, val chunkMs: Int, val tailMs: Int)
+
+val LATENCY_PRESETS = listOf(
+    LatencyPreset("کم‌ترین تأخیر — تکه‌های ۱٫۲ ثانیه", 1_200, 200),
+    LatencyPreset("متعادل — تکه‌های ۲ ثانیه", 2_000, 260),
+    LatencyPreset("کیفیت بیشتر — تکه‌های ۳٫۵ ثانیه", 3_500, 380),
+)
+
 /**
- * کلیدهای API در EncryptedSharedPreferences ذخیره می‌شوند.
- * اگر Keystore دستگاه مشکل داشت، به حافظهٔ خصوصی رمزنگاری‌نشده برمی‌گردیم.
+ * فقط یک کلید و یک آدرس: هر دو مرحله روی گروک.
+ * نام خانه‌های ذخیره‌سازی از نسخهٔ قبل عوض نشده تا کلید وارد‌شده از دست نرود.
  */
 class Prefs(context: Context) {
 
@@ -244,29 +254,31 @@ class Prefs(context: Context) {
     private fun s(k: String, d: String) = sp.getString(k, d) ?: d
     private fun w(k: String, v: String) { sp.edit().putString(k, v).apply() }
 
-    var deepSeekKey: String
-        get() = s("ds_key", "")
-        set(v) { w("ds_key", v) }
-
-    var deepSeekBaseUrl: String
-        get() = s("ds_url", "https://api.deepseek.com")
-        set(v) { w("ds_url", v) }
-
-    var deepSeekModel: String
-        get() = s("ds_model", "deepseek-chat")
-        set(v) { w("ds_model", v) }
-
-    var sttKey: String
+    var apiKey: String
         get() = s("stt_key", "")
         set(v) { w("stt_key", v) }
 
-    var sttBaseUrl: String
-        get() = s("stt_url", "https://api.groq.com/openai/v1")
+    var baseUrl: String
+        get() {
+            val v = s("stt_url", GROQ_URL)
+            // آدرس دیپ‌سیک نسخهٔ قبل خودکار دور ریخته می‌شود
+            return if (v.isBlank() || v.contains("deepseek")) GROQ_URL else v
+        }
         set(v) { w("stt_url", v) }
 
     var sttModel: String
-        get() = s("stt_model", "whisper-large-v3-turbo")
+        get() {
+            val v = s("stt_model", STT_MODEL)
+            return if (v.isBlank()) STT_MODEL else v
+        }
         set(v) { w("stt_model", v) }
+
+    var chatModel: String
+        get() {
+            val v = s("ds_model", CHAT_MODEL)
+            return if (v.isBlank() || v.startsWith("deepseek")) CHAT_MODEL else v
+        }
+        set(v) { w("ds_model", v) }
 
     /** کد ISO زبان مبدأ. "auto" یعنی تشخیص خودکار که کندتر است. */
     var sourceLang: String
@@ -277,6 +289,10 @@ class Prefs(context: Context) {
     var audioSource: String
         get() = s("audio_src", "internal")
         set(v) { w("audio_src", v) }
+
+    var latencyPreset: Int
+        get() = sp.getInt("latency", 1).coerceIn(0, LATENCY_PRESETS.size - 1)
+        set(v) { sp.edit().putInt("latency", v).apply() }
 
     var showSource: Boolean
         get() = sp.getBoolean("show_src", true)
@@ -291,6 +307,12 @@ class Prefs(context: Context) {
         set(v) { sp.edit().putInt("bottom_dp", v).apply() }
 
     fun uiSettings() = UiSettings(fontSize, bottomDp, showSource)
+
+    companion object {
+        const val GROQ_URL = "https://api.groq.com/openai/v1"
+        const val STT_MODEL = "whisper-large-v3-turbo"
+        const val CHAT_MODEL = "llama-3.3-70b-versatile"
+    }
 }
 
 // ======================================================= زبان‌ها
@@ -330,7 +352,6 @@ fun langOf(code: String): Lang = LANGS.firstOrNull { it.code == code } ?: LANGS[
 
 object WavEncoder {
 
-    /** PCM شانزده‌بیتی مونو را به فایل WAV در حافظه تبدیل می‌کند. */
     fun encode(pcm: ShortArray, length: Int, sampleRate: Int): ByteArray {
         val dataSize = length * 2
         val bb = ByteBuffer.allocate(44 + dataSize).order(ByteOrder.LITTLE_ENDIAN)
@@ -371,8 +392,7 @@ object AudioCapture {
         .build()
 
     /**
-     * ضبط صدای پخش‌شدهٔ خود دستگاه. برنامه‌های DRM‌دار یا آن‌هایی که
-     * ALLOW_CAPTURE_BY_NONE گذاشته‌اند فقط سکوت می‌دهند.
+     * ضبط صدای پخش‌شدهٔ خود دستگاه. برنامه‌های DRM‌دار فقط سکوت می‌دهند.
      */
     fun forPlayback(projection: MediaProjection): AudioRecord {
         val config = AudioPlaybackCaptureConfiguration.Builder(projection)
@@ -389,7 +409,6 @@ object AudioCapture {
         return rec
     }
 
-    /** میکروفون، برای برنامه‌هایی که صدای داخلی‌شان قابل ضبط نیست. */
     fun forMic(): AudioRecord {
         for (src in intArrayOf(
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
@@ -410,17 +429,19 @@ object AudioCapture {
 }
 
 /**
- * تشخیص گفتار بر پایهٔ انرژی با کف نویز تطبیقی.
- * جریان PCM را می‌گیرد و هر «جمله» را که تمام شد بیرون می‌دهد،
- * تا فقط تکه‌های معنادار به سرویس رونویسی بروند.
+ * تشخیص گفتار با کف نویز تطبیقی.
+ * برای کم‌کردن تأخیر منتظر پایان جمله نمی‌ماند: هر chunkMs یک تکه می‌فرستد،
+ * ولی نقطهٔ برش را روی کم‌انرژی‌ترین فریم آخر می‌گذارد تا وسط کلمه نیفتد.
  */
 class VadSegmenter(
     private val sampleRate: Int = AudioCapture.SAMPLE_RATE,
     private val frameMs: Int = 20,
-    private val minSpeechMs: Int = 350,
-    private val tailSilenceMs: Int = 400,
-    private val maxSegmentMs: Int = 5_000,
-    private val preRollMs: Int = 240,
+    private val minSpeechMs: Int = 260,
+    private val tailSilenceMs: Int = 260,
+    private val chunkMs: Int = 2_000,
+    private val preRollMs: Int = 200,
+    private val overlapMs: Int = 100,
+    private val cutSearchMs: Int = 320,
     private val speechMarginDb: Float = 9f,
     private val absoluteFloorDb: Float = -50f,
 ) {
@@ -428,24 +449,26 @@ class VadSegmenter(
         val pcm: ShortArray,
         val durationMs: Int,
         val avgDb: Float,
-        /** true یعنی به سقف طول رسیده و وسط حرف بریده شده است. */
         val continued: Boolean,
+        val createdAt: Long,
     )
 
     private val frameSize = sampleRate * frameMs / 1000
-    private val tailFrames = tailSilenceMs / frameMs
-    private val maxFrames = maxSegmentMs / frameMs
-    private val preRollFrames = preRollMs / frameMs
+    private val tailFrames = maxOf(1, tailSilenceMs / frameMs)
+    private val chunkFrames = maxOf(10, chunkMs / frameMs)
+    private val preRollFrames = maxOf(1, preRollMs / frameMs)
+    private val overlapFrames = maxOf(1, overlapMs / frameMs)
+    private val cutSearchFrames = maxOf(2, cutSearchMs / frameMs)
 
     private val partial = ShortArray(frameSize)
     private var partialLen = 0
 
     private val preRoll = ArrayDeque<ShortArray>()
+    private val preRollDb = ArrayDeque<Float>()
     private var speech = ArrayList<ShortArray>()
+    private var dbs = ArrayList<Float>()
     private var inSpeech = false
     private var silenceRun = 0
-    private var dbSum = 0.0
-    private var dbCount = 0
     private var noiseFloor = -60f
 
     var lastFrameDb: Float = -90f
@@ -466,7 +489,7 @@ class VadSegmenter(
     }
 
     fun flush(out: (Segment) -> Unit) {
-        if (inSpeech) emit(false, out)
+        if (inSpeech) endOfSpeech(out)
     }
 
     private fun pushFrame(frame: ShortArray, out: (Segment) -> Unit) {
@@ -480,52 +503,81 @@ class VadSegmenter(
 
         if (inSpeech) {
             speech.add(frame)
-            dbSum += db
-            dbCount++
+            dbs.add(db)
             silenceRun = if (isSpeech) 0 else silenceRun + 1
-            if (silenceRun >= tailFrames) emit(false, out)
-            else if (speech.size >= maxFrames) emit(true, out)
+            if (silenceRun >= tailFrames) endOfSpeech(out)
+            else if (speech.size >= chunkFrames) chunkCut(out)
         } else {
             preRoll.addLast(frame)
-            while (preRoll.size > preRollFrames) preRoll.removeFirst()
+            preRollDb.addLast(db)
+            while (preRoll.size > preRollFrames) {
+                preRoll.removeFirst()
+                preRollDb.removeFirst()
+            }
             if (isSpeech) {
                 inSpeech = true
                 silenceRun = 0
-                dbSum = db.toDouble()
-                dbCount = 1
-                speech = ArrayList(preRoll)   // چند فریم قبل از شروع هم نگه داشته می‌شود
+                speech = ArrayList(preRoll)
+                dbs = ArrayList(preRollDb)
                 preRoll.clear()
+                preRollDb.clear()
             }
         }
     }
 
-    private fun emit(forceCut: Boolean, out: (Segment) -> Unit) {
+    /** جمله تمام شد: سکوت انتهایی جز دو فریم دور ریخته می‌شود. */
+    private fun endOfSpeech(out: (Segment) -> Unit) {
+        val cut = (speech.size - silenceRun + 2).coerceIn(1, speech.size)
+        emit(cut, false, out)
+    }
+
+    /** به سقف طول تکه رسیدیم: آرام‌ترین نقطهٔ نزدیک را برای برش پیدا کن. */
+    private fun chunkCut(out: (Segment) -> Unit) {
+        val total = speech.size
+        val from = maxOf(1, total - cutSearchFrames)
+        var cut = total
+        var best = Float.MAX_VALUE
+        for (i in from until total) {
+            if (dbs[i] < best) {
+                best = dbs[i]
+                cut = i + 1
+            }
+        }
+        emit(cut, true, out)
+    }
+
+    private fun emit(cutIndex: Int, forceCut: Boolean, out: (Segment) -> Unit) {
         val frames = speech
-        val total = frames.size
-        val speechFrames = total - silenceRun
-        val avgDb = if (dbCount > 0) (dbSum / dbCount).toFloat() else -90f
+        val dbList = dbs
+        val cut = cutIndex.coerceIn(1, frames.size)
+        val head = ArrayList(frames.subList(0, cut))
+        val headDb = ArrayList(dbList.subList(0, cut))
 
         if (forceCut) {
-            val keep = minOf(preRollFrames, total)
-            speech = ArrayList(frames.subList(total - keep, total))  // همپوشانی تا کلمه نصف نشود
+            val keepFrom = maxOf(0, cut - overlapFrames)
+            speech = ArrayList(frames.subList(keepFrom, frames.size))
+            dbs = ArrayList(dbList.subList(keepFrom, dbList.size))
             inSpeech = true
         } else {
             speech = ArrayList()
+            dbs = ArrayList()
             inSpeech = false
             preRoll.clear()
+            preRollDb.clear()
         }
         silenceRun = 0
-        dbSum = 0.0
-        dbCount = 0
 
-        if (speechFrames * frameMs < minSpeechMs) return
-        val pcm = ShortArray(total * frameSize)
+        val voiced = headDb.count { it > absoluteFloorDb }
+        if (voiced * frameMs < minSpeechMs) return
+
+        val pcm = ShortArray(head.size * frameSize)
         var p = 0
-        for (f in frames) {
+        for (f in head) {
             System.arraycopy(f, 0, pcm, p, frameSize)
             p += frameSize
         }
-        out(Segment(pcm, total * frameMs, avgDb, forceCut))
+        val avg = if (headDb.isEmpty()) -90f else headDb.average().toFloat()
+        out(Segment(pcm, head.size * frameMs, avg, forceCut, System.currentTimeMillis()))
     }
 
     private fun dbfs(f: ShortArray): Float {
@@ -541,21 +593,83 @@ class VadSegmenter(
 // ======================================================= شبکه
 
 object Net {
-    val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .writeTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(35, TimeUnit.SECONDS)
-        .callTimeout(60, TimeUnit.SECONDS)
+
+    private val pool = ConnectionPool(6, 5, TimeUnit.MINUTES)
+
+    private fun base() = OkHttpClient.Builder()
+        .connectionPool(pool)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .writeTimeout(12, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+
+    /** رونویسی: مهلت کوتاه، چون یک درخواست گیرکرده کل صف را عقب می‌اندازد. */
+    val stt: OkHttpClient = base()
+        .readTimeout(15, TimeUnit.SECONDS)
+        .callTimeout(15, TimeUnit.SECONDS)
         .build()
+
+    /** ترجمهٔ استریمی: مهلت بلندتر لازم دارد. */
+    val chat: OkHttpClient = base()
+        .readTimeout(25, TimeUnit.SECONDS)
+        .callTimeout(30, TimeUnit.SECONDS)
+        .build()
+
+    /**
+     * اتصال TLS را پیش از اولین جمله باز می‌کند و کلید را همان اول اعتبارسنجی می‌کند.
+     * حدود نیم ثانیه از تأخیر اولین زیرنویس کم می‌شود.
+     */
+    suspend fun warmUp(baseUrl: String, apiKey: String) = withContext(Dispatchers.IO) {
+        runCatching {
+            val req = Request.Builder()
+                .url(baseUrl.trimEnd('/') + "/models")
+                .addHeader("Authorization", "Bearer " + apiKey)
+                .build()
+            stt.newCall(req).execute().use { r ->
+                r.body?.string()
+                if (r.code == 401 || r.code == 403) {
+                    Bus.lastError.value = "کلید API پذیرفته نشد (کد " + r.code + ")"
+                }
+            }
+        }
+        Unit
+    }
+
+    /** آزمایش دستی از داخل برنامه: کلید سالم است؟ مدل‌ها موجودند؟ */
+    suspend fun checkKey(
+        baseUrl: String,
+        apiKey: String,
+        sttModel: String,
+        chatModel: String,
+    ): String = withContext(Dispatchers.IO) {
+        try {
+            val req = Request.Builder()
+                .url(baseUrl.trimEnd('/') + "/models")
+                .addHeader("Authorization", "Bearer " + apiKey)
+                .build()
+            stt.newCall(req).execute().use { r ->
+                val body = r.body?.string().orEmpty()
+                if (!r.isSuccessful) {
+                    return@withContext "پذیرفته نشد (کد " + r.code + "): " + body.take(120)
+                }
+                val arr: JSONArray? = JSONObject(body).optJSONArray("data")
+                val names = ArrayList<String>()
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        names.add(arr.optJSONObject(i)?.optString("id").orEmpty())
+                    }
+                }
+                val a = if (names.contains(sttModel)) "موجود" else "پیدا نشد"
+                val b = if (names.contains(chatModel)) "موجود" else "پیدا نشد"
+                "کلید سالم است. مدل شنیدن: " + a + " — مدل ترجمه: " + b
+            }
+        } catch (t: Throwable) {
+            "خطای شبکه: " + (t.message ?: "نامعلوم")
+        }
+    }
 }
 
-/**
- * هر سرویس سازگار با OpenAI که مسیر /audio/transcriptions دارد:
- * Groq (سریع‌ترین)، OpenAI، یا سرور whisper.cpp خودتان.
- * دیپ‌سیک API صوتی ندارد، پس رونویسی از اینجا می‌آید.
- */
-class SttClient(private val http: OkHttpClient = Net.client) {
+/** رونویسی با ویسپر روی گروک (سازگار با OpenAI). */
+class SttClient(private val http: OkHttpClient = Net.stt) {
 
     data class Config(
         val baseUrl: String,
@@ -567,17 +681,17 @@ class SttClient(private val http: OkHttpClient = Net.client) {
     suspend fun transcribe(wav: ByteArray, cfg: Config, prompt: String?): String =
         withContext(Dispatchers.IO) {
             val body = MultipartBody.Builder().setType(MultipartBody.FORM)
-                .addFormDataPart("file", "audio.wav", wav.toRequestBody(WAV))
+                .addFormDataPart("file", "a.wav", wav.toRequestBody(WAV))
                 .addFormDataPart("model", cfg.model)
                 .addFormDataPart("response_format", "json")
                 .addFormDataPart("temperature", "0")
                 .also { b ->
-                    // زبان از قبل مشخص است، پس مرحلهٔ تشخیص زبان حذف می‌شود
+                    // زبان از پیش معلوم است، پس مرحلهٔ تشخیص زبان حذف می‌شود
                     if (!cfg.language.isNullOrBlank() && cfg.language != "auto") {
                         b.addFormDataPart("language", cfg.language)
                     }
-                    // متن قبلی به عنوان زمینه: دقت اسم‌ها و پیوستگی جمله بالا می‌رود
-                    if (!prompt.isNullOrBlank()) b.addFormDataPart("prompt", prompt.take(400))
+                    // متن تکهٔ قبل به عنوان زمینه، برای پیوستگی کلمه‌های بریده
+                    if (!prompt.isNullOrBlank()) b.addFormDataPart("prompt", prompt.take(220))
                 }
                 .build()
 
@@ -589,7 +703,7 @@ class SttClient(private val http: OkHttpClient = Net.client) {
 
             http.newCall(req).execute().use { r ->
                 val text = r.body?.string().orEmpty()
-                if (!r.isSuccessful) throw IOException("STT " + r.code + ": " + text.take(220))
+                if (!r.isSuccessful) throw IOException("STT " + r.code + ": " + text.take(200))
                 runCatching { JSONObject(text).optString("text") }.getOrDefault("").trim()
             }
         }
@@ -599,14 +713,14 @@ class SttClient(private val http: OkHttpClient = Net.client) {
     }
 }
 
-/** ترجمه با دیپ‌سیک به صورت استریم تا متن فارسی کلمه‌به‌کلمه ظاهر شود. */
-class DeepSeekTranslator(private val http: OkHttpClient = Net.client) {
+/** ترجمه با مدل چت گروک، استریمی تا متن فارسی کلمه‌به‌کلمه بیاید. */
+class Translator(private val http: OkHttpClient = Net.chat) {
 
     data class Config(
         val baseUrl: String,
         val apiKey: String,
         val model: String,
-        val temperature: Double = 1.3,   // مقدار پیشنهادی خود دیپ‌سیک برای ترجمه
+        val temperature: Double = 0.2,
     )
 
     suspend fun translate(
@@ -619,8 +733,8 @@ class DeepSeekTranslator(private val http: OkHttpClient = Net.client) {
 
         val messages = JSONArray().apply {
             put(msg("system", systemPrompt(sourceLanguageEnglish)))
-            // چند جملهٔ قبلی برای پیوستگی ضمیرها و لحن
-            history.takeLast(3).forEach { pair ->
+            // دو جملهٔ قبلی برای پیوستگی ضمیرها و لحن
+            history.takeLast(2).forEach { pair ->
                 put(msg("user", pair.first))
                 put(msg("assistant", pair.second))
             }
@@ -632,8 +746,7 @@ class DeepSeekTranslator(private val http: OkHttpClient = Net.client) {
             put("messages", messages)
             put("stream", true)
             put("temperature", cfg.temperature)
-            put("max_tokens", 400)
-            put("frequency_penalty", 0.2)
+            put("max_tokens", 260)
         }
 
         val req = Request.Builder()
@@ -646,7 +759,7 @@ class DeepSeekTranslator(private val http: OkHttpClient = Net.client) {
         http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) {
                 throw IOException(
-                    "DeepSeek " + resp.code + ": " + resp.body?.string()?.take(220).orEmpty()
+                    "Chat " + resp.code + ": " + resp.body?.string()?.take(200).orEmpty()
                 )
             }
             val source = resp.body!!.source()
@@ -672,16 +785,12 @@ class DeepSeekTranslator(private val http: OkHttpClient = Net.client) {
     private fun msg(role: String, content: String) =
         JSONObject().put("role", role).put("content", content)
 
-    /** پرامپت ثابت است تا کش زمینهٔ دیپ‌سیک فعال شود و تأخیر اولین توکن کم بماند. */
-    private fun systemPrompt(src: String) = """
-        You translate live subtitles from $src into Persian (Farsi).
-        Output ONLY the Persian translation of the last line: no source text, no quotes,
-        no explanations, no transliteration, no romanization.
-        Style: natural spoken Persian, short subtitle lines, keep names, numbers and units,
-        keep the register of the original (formal, casual or slang).
-        If the line is cut mid-sentence, translate the fragment as it is and never invent an ending.
-        If there is nothing translatable, reply with a single hyphen: -
-    """.trimIndent()
+    /** کوتاه نگه داشته شده تا مرحلهٔ prefill سریع‌تر تمام شود. */
+    private fun systemPrompt(src: String) = "Translate each line from " + src +
+        " into natural spoken Persian. Reply with the Persian only: no quotes, no notes," +
+        " no source text, no romanization. Subtitle style, short and idiomatic." +
+        " Keep names and numbers. A fragment stays a fragment, never invent an ending." +
+        " If nothing is translatable, reply with a single hyphen: -"
 
     private companion object {
         val JSON = "application/json; charset=utf-8".toMediaType()
@@ -690,7 +799,7 @@ class DeepSeekTranslator(private val http: OkHttpClient = Net.client) {
 
 // ======================================================= پاک‌سازی متن
 
-/** ویسپر روی موسیقی و سکوت جملات خیالی می‌سازد؛ اینجا فیلتر می‌شوند. */
+/** ویسپر روی موسیقی و سکوت جمله‌های خیالی می‌سازد؛ اینجا فیلتر می‌شوند. */
 object TextClean {
 
     private val ARTIFACTS = setOf(
@@ -703,9 +812,13 @@ object TextClean {
 
     private val BRACKETED = Regex("^[\\[(].*[\\])]$")
     private val PUNCT_ONLY = Regex("^[\\p{Punct}\\s\u266A\u266B\u2026\u00B7\u2014\u2013\u200C]+$")
+    private val THINK = Regex("(?s)<think>.*?</think>")
 
-    fun normalize(s: String): String =
-        s.replace('\n', ' ').replace(Regex("\\s+"), " ").trim()
+    fun normalize(s: String): String = s
+        .replace(THINK, "")
+        .replace('\n', ' ')
+        .replace(Regex("\\s+"), " ")
+        .trim()
 
     fun isNoise(text: String, durationMs: Int): Boolean {
         if (text.isBlank()) return true
@@ -716,7 +829,6 @@ object TextClean {
         return key in ARTIFACTS && durationMs < 2_000
     }
 
-    /** حلقهٔ تکرار ویسپر را می‌بندد. */
     fun collapseRepeats(s: String): String {
         val words = s.split(' ')
         if (words.size < 6) return s
@@ -734,6 +846,18 @@ object TextClean {
             }
         }
         return s
+    }
+
+    /** پیام خطای خام سرویس را به یک جملهٔ کوتاه فارسی تبدیل می‌کند. */
+    fun friendlyError(raw: String): String = when {
+        raw.contains("401") || raw.contains("403") -> "کلید API پذیرفته نشد"
+        raw.contains("402") || raw.contains("insufficient") -> "اعتبار حساب تمام شده"
+        raw.contains("429") -> "سقف درخواست پر شد، کمی صبر کنید"
+        raw.contains("decommission") || raw.contains("does not exist") -> "نام مدل معتبر نیست"
+        raw.contains("timeout", true) || raw.contains("timed out", true) -> "اینترنت کند است"
+        raw.contains("Unable to resolve host") || raw.contains("Failed to connect") ->
+            "به سرویس وصل نشد"
+        else -> raw.take(90)
     }
 }
 EOF_CORE
@@ -756,10 +880,7 @@ import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
 
-/**
- * فونت وزیرمتن از assets خوانده می‌شود تا اگر فایل نبود بیلد نشکند.
- * مسیر: app/src/main/assets/fonts/
- */
+/** فونت وزیرمتن از assets، با بازگشت بی‌صدا به فونت پیش‌فرض اگر نبود. */
 object VazirFont {
 
     private val CANDIDATES = listOf(
@@ -795,8 +916,7 @@ object VazirFont {
 
 /**
  * پنجرهٔ شفاف زیرنویس روی همهٔ برنامه‌ها.
- * FLAG_NOT_TOUCHABLE دارد تا لمس‌ها به پلیر زیرش برسند؛
- * جای زیرنویس از داخل خود برنامه تنظیم می‌شود.
+ * FLAG_NOT_TOUCHABLE دارد تا لمس‌ها به پلیر زیرش برسند.
  */
 class OverlayController(private val context: Context) {
 
@@ -841,10 +961,12 @@ class OverlayController(private val context: Context) {
         }
     }
 
-    /** متن مبدأ چند صد میلی‌ثانیه پیش از ترجمه دیده می‌شود. */
+    /** متن مبدأ پیش از ترجمه دیده می‌شود، پس چشم زودتر چیزی می‌گیرد. */
     fun beginLine(source: String) {
         main.post {
             show()
+            sourceView?.setTextColor(0xCCFFFFFF.toInt())
+            sourceView?.visibility = if (settings.showSource) View.VISIBLE else View.GONE
             sourceView?.text = source
             persianView?.alpha = 0.45f   // خط قبلی محو می‌ماند تا چشمک نزند
         }
@@ -869,6 +991,19 @@ class OverlayController(private val context: Context) {
 
     fun finishLine() {
         main.post {
+            persianView?.alpha = 1f
+            scheduleHide()
+        }
+    }
+
+    /** خطا را روی صفحه نشان می‌دهد تا لازم نباشد از فیلم بیرون بیایید. */
+    fun showError(message: String) {
+        main.post {
+            show()
+            sourceView?.visibility = View.VISIBLE
+            sourceView?.setTextColor(0xFFFF8A80.toInt())
+            sourceView?.text = message
+            persianView?.text = ""
             persianView?.alpha = 1f
             scheduleHide()
         }
@@ -977,22 +1112,27 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * دو مرحلهٔ زنجیره‌وار: تا وقتی جملهٔ n ترجمه می‌شود، جملهٔ n+1 رونویسی می‌شود.
+ * دو مرحلهٔ زنجیره‌وار: تا وقتی تکهٔ n ترجمه می‌شود، تکهٔ n+1 رونویسی می‌شود.
  * ترتیب حفظ می‌شود چون هر مرحله تک‌رشته‌ای است.
- * صف‌ها DROP_OLDEST هستند: اگر شبکه عقب بیفتد، زیرنویس «حال» را نشان می‌دهد نه گذشته را.
+ *
+ * دو سازوکار برای اینکه زیرنویس عقب نیفتد:
+ *  - صف‌ها DROP_OLDEST هستند، پس حال نمایش داده می‌شود نه گذشته
+ *  - هر چیزی که بیش از چند ثانیه در صف مانده باشد دور ریخته می‌شود
  */
 class SubtitlePipeline(
     private val scope: CoroutineScope,
     private val overlay: OverlayController,
     private val sttCfg: SttClient.Config,
-    private val dsCfg: DeepSeekTranslator.Config,
+    private val chatCfg: Translator.Config,
     private val sourceLanguageEnglish: String,
 ) {
+    private class Line(val text: String, val createdAt: Long)
+
     private val stt = SttClient()
-    private val translator = DeepSeekTranslator()
+    private val translator = Translator()
 
     private val segments = Channel<VadSegmenter.Segment>(3, BufferOverflow.DROP_OLDEST)
-    private val lines = Channel<String>(4, BufferOverflow.DROP_OLDEST)
+    private val lines = Channel<Line>(3, BufferOverflow.DROP_OLDEST)
 
     fun start() {
         scope.launch(Dispatchers.IO) { sttLoop() }
@@ -1011,31 +1151,31 @@ class SubtitlePipeline(
     private suspend fun sttLoop() {
         var previous = ""
         for (seg in segments) {
+            if (System.currentTimeMillis() - seg.createdAt > STALE_AUDIO_MS) continue
             try {
                 val wav = WavEncoder.encode(seg.pcm, seg.pcm.size, AudioCapture.SAMPLE_RATE)
-                var text = TextClean.normalize(stt.transcribe(wav, sttCfg, previous.takeLast(300)))
+                var text = TextClean.normalize(stt.transcribe(wav, sttCfg, previous))
                 text = TextClean.collapseRepeats(text)
                 if (TextClean.isNoise(text, seg.durationMs)) continue
                 if (text.equals(previous, ignoreCase = true) && text.length < 30) continue
                 previous = text
-                Bus.status.value = "در حال ترجمه…"
-                lines.trySend(text)
+                lines.trySend(Line(text, System.currentTimeMillis()))
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
-                Bus.lastError.value = "رونویسی: " + t.message
-                delay(500)
+                report("شنیدن", t)
             }
         }
     }
 
     private suspend fun translateLoop() {
         val history = ArrayDeque<Pair<String, String>>()
-        for (src in lines) {
+        for (line in lines) {
+            if (System.currentTimeMillis() - line.createdAt > STALE_TEXT_MS) continue
             try {
-                overlay.beginLine(src)
+                overlay.beginLine(line.text)
                 val fa = TextClean.normalize(
-                    translator.translate(src, sourceLanguageEnglish, dsCfg, history.toList()) {
+                    translator.translate(line.text, sourceLanguageEnglish, chatCfg, history.toList()) {
                         overlay.updateTranslation(it)
                     }
                 )
@@ -1043,18 +1183,30 @@ class SubtitlePipeline(
                     overlay.finishLine()
                 } else {
                     overlay.commitLine(fa)
-                    history.addLast(src to fa)
-                    while (history.size > 3) history.removeFirst()
+                    history.addLast(line.text to fa)
+                    while (history.size > 2) history.removeFirst()
                 }
                 Bus.status.value = "در حال گوش دادن…"
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
-                Bus.lastError.value = "ترجمه: " + t.message
+                report("ترجمه", t)
                 overlay.finishLine()
-                delay(500)
             }
         }
+    }
+
+    private suspend fun report(stage: String, t: Throwable) {
+        val raw = t.message ?: ""
+        val friendly = TextClean.friendlyError(raw)
+        Bus.lastError.value = stage + ": " + friendly
+        overlay.showError(friendly)
+        delay(if (raw.contains("429")) 1_500 else 400)
+    }
+
+    private companion object {
+        const val STALE_AUDIO_MS = 6_000L
+        const val STALE_TEXT_MS = 5_000L
     }
 }
 EOF_PIPELINE
@@ -1127,6 +1279,9 @@ class CaptureService : Service() {
     }
 
     private fun begin(prefs: Prefs, internal: Boolean, resultCode: Int, data: Intent?) {
+        // اتصال را همین اول گرم می‌کنیم تا اولین جمله معطل TLS نشود
+        scope.launch { Net.warmUp(prefs.baseUrl, prefs.apiKey) }
+
         val ov = OverlayController(this)
         ov.applySettings(prefs.uiSettings())
         ov.attach()
@@ -1165,15 +1320,15 @@ class CaptureService : Service() {
             scope = scope,
             overlay = ov,
             sttCfg = SttClient.Config(
-                baseUrl = prefs.sttBaseUrl,
-                apiKey = prefs.sttKey,
+                baseUrl = prefs.baseUrl,
+                apiKey = prefs.apiKey,
                 model = prefs.sttModel,
                 language = lang.code,
             ),
-            dsCfg = DeepSeekTranslator.Config(
-                baseUrl = prefs.deepSeekBaseUrl,
-                apiKey = prefs.deepSeekKey,
-                model = prefs.deepSeekModel,
+            chatCfg = Translator.Config(
+                baseUrl = prefs.baseUrl,
+                apiKey = prefs.apiKey,
+                model = prefs.chatModel,
             ),
             sourceLanguageEnglish = lang.english,
         ).also { it.start() }
@@ -1184,9 +1339,11 @@ class CaptureService : Service() {
 
         scope.launch { Bus.settings.collectLatest { ov.applySettings(it) } }
 
+        val preset = LATENCY_PRESETS[prefs.latencyPreset]
+
         captureJob = scope.launch(Dispatchers.IO) {
-            val vad = VadSegmenter()
-            val buf = ShortArray(AudioCapture.SAMPLE_RATE / 10)   // ۱۰۰ میلی‌ثانیه
+            val vad = VadSegmenter(chunkMs = preset.chunkMs, tailSilenceMs = preset.tailMs)
+            val buf = ShortArray(AudioCapture.SAMPLE_RATE / 20)   // ۵۰ میلی‌ثانیه
             var lastVoiceAt = System.currentTimeMillis()
             var peakDb = -90f
             rec.startRecording()
@@ -1350,6 +1507,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -1393,12 +1552,8 @@ class MainActivity : ComponentActivity() {
     // ------------------------------------------------------- شروع و توقف
 
     private fun tryStart() {
-        if (prefs.deepSeekKey.isBlank()) {
-            Bus.lastError.value = "کلید API دیپ‌سیک را وارد کنید"
-            return
-        }
-        if (prefs.sttKey.isBlank() && prefs.sttBaseUrl.startsWith("https")) {
-            Bus.lastError.value = "کلید سرویس تبدیل گفتار به متن را وارد کنید"
+        if (prefs.apiKey.isBlank()) {
+            Bus.lastError.value = "کلید API گروک را وارد کنید"
             return
         }
         if (!Settings.canDrawOverlays(this)) {
@@ -1432,7 +1587,7 @@ class MainActivity : ComponentActivity() {
             if (data != null) putExtra(CaptureService.EXTRA_RESULT_DATA, data)
         }
         ContextCompat.startForegroundService(this, i)
-        moveTaskToBack(true)   // برنامه کنار می‌رود تا کاربر فیلمش را ببیند
+        moveTaskToBack(true)   // برنامه کنار می‌رود تا فیلم دیده شود
     }
 
     private fun stopCapture() {
@@ -1440,6 +1595,15 @@ class MainActivity : ComponentActivity() {
             this,
             Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_STOP)
         )
+    }
+
+    private fun testKey() {
+        Bus.status.value = "در حال آزمایش کلید…"
+        lifecycleScope.launch {
+            Bus.status.value = Net.checkKey(
+                prefs.baseUrl, prefs.apiKey, prefs.sttModel, prefs.chatModel
+            )
+        }
     }
 
     private fun openOverlaySettings() = startActivity(
@@ -1462,14 +1626,13 @@ class MainActivity : ComponentActivity() {
                 PackageManager.PERMISSION_GRANTED
         }
 
-        var dsKey by remember { mutableStateOf(prefs.deepSeekKey) }
-        var sttKey by remember { mutableStateOf(prefs.sttKey) }
-        var sttUrl by remember { mutableStateOf(prefs.sttBaseUrl) }
+        var key by remember { mutableStateOf(prefs.apiKey) }
+        var baseUrl by remember { mutableStateOf(prefs.baseUrl) }
         var sttModel by remember { mutableStateOf(prefs.sttModel) }
-        var dsUrl by remember { mutableStateOf(prefs.deepSeekBaseUrl) }
-        var dsModel by remember { mutableStateOf(prefs.deepSeekModel) }
+        var chatModel by remember { mutableStateOf(prefs.chatModel) }
         var lang by remember { mutableStateOf(prefs.sourceLang) }
         var audioSrc by remember { mutableStateOf(prefs.audioSource) }
+        var latency by remember { mutableStateOf(prefs.latencyPreset) }
         var showSrc by remember { mutableStateOf(prefs.showSource) }
         var fontSize by remember { mutableStateOf(prefs.fontSize) }
         var bottomDp by remember { mutableStateOf(prefs.bottomDp.toFloat()) }
@@ -1488,8 +1651,8 @@ class MainActivity : ComponentActivity() {
         ) {
             Text("زیرنویس زندهٔ فارسی", style = MaterialTheme.typography.titleLarge)
             Text(
-                "صدای پخش‌شده در گوشی را می‌شنود، رونویسی می‌کند و با دیپ‌سیک " +
-                    "به فارسی روی صفحه نشان می‌دهد.",
+                "صدای پخش‌شده در گوشی را می‌شنود و با گروک به فارسی روی صفحه نشان می‌دهد. " +
+                    "فقط یک کلید لازم است.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -1504,26 +1667,19 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            Section("کلیدها")
+            Section("کلید گروک")
             OutlinedTextField(
-                value = dsKey,
-                onValueChange = { dsKey = it; prefs.deepSeekKey = it.trim() },
-                label = { Text("کلید API دیپ‌سیک") },
+                value = key,
+                onValueChange = { key = it; prefs.apiKey = it.trim() },
+                label = { Text("کلید API گروک") },
+                supportingText = { Text("از console.groq.com، با gsk_ شروع می‌شود") },
                 singleLine = true,
                 visualTransformation = PasswordVisualTransformation(),
                 modifier = Modifier.fillMaxWidth(),
             )
-            OutlinedTextField(
-                value = sttKey,
-                onValueChange = { sttKey = it; prefs.sttKey = it.trim() },
-                label = { Text("کلید گفتار به متن (Groq یا OpenAI)") },
-                supportingText = {
-                    Text("دیپ‌سیک API صوتی ندارد، پس رونویسی باید از سرویس دیگری بیاید.")
-                },
-                singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth(),
-            )
+            OutlinedButton(onClick = { testKey() }, modifier = Modifier.fillMaxWidth()) {
+                Text("آزمایش کلید و مدل‌ها")
+            }
 
             Section("زبان صدا")
             Picker(
@@ -1531,6 +1687,20 @@ class MainActivity : ComponentActivity() {
                 options = LANGS.map { it.fa },
                 selectedIndex = LANGS.indexOfFirst { it.code == lang }.coerceAtLeast(0),
                 onSelect = { i -> lang = LANGS[i].code; prefs.sourceLang = lang },
+            )
+
+            Section("سرعت و کیفیت")
+            Picker(
+                label = "حالت تأخیر",
+                options = LATENCY_PRESETS.map { it.label },
+                selectedIndex = latency,
+                onSelect = { i -> latency = i; prefs.latencyPreset = i },
+            )
+            Text(
+                "تکهٔ کوتاه‌تر یعنی زیرنویس زودتر می‌آید ولی جمله‌ها بریده‌تر و ترجمه خام‌تر " +
+                    "می‌شود، و تعداد درخواست‌ها بالا می‌رود.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
             Section("منبع صدا")
@@ -1568,30 +1738,26 @@ class MainActivity : ComponentActivity() {
             }
             if (advanced) {
                 OutlinedTextField(
-                    value = sttUrl,
-                    onValueChange = { sttUrl = it; prefs.sttBaseUrl = it.trim() },
-                    label = { Text("آدرس پایهٔ گفتار به متن") },
-                    supportingText = { Text("Groq: https://api.groq.com/openai/v1") },
+                    value = baseUrl,
+                    onValueChange = { baseUrl = it; prefs.baseUrl = it.trim() },
+                    label = { Text("آدرس پایهٔ سرویس") },
+                    supportingText = { Text(Prefs.GROQ_URL) },
                     singleLine = true, modifier = Modifier.fillMaxWidth(),
                 )
                 OutlinedTextField(
                     value = sttModel,
                     onValueChange = { sttModel = it; prefs.sttModel = it.trim() },
-                    label = { Text("مدل گفتار به متن") },
-                    supportingText = { Text("whisper-large-v3-turbo") },
+                    label = { Text("مدل شنیدن") },
+                    supportingText = { Text(Prefs.STT_MODEL) },
                     singleLine = true, modifier = Modifier.fillMaxWidth(),
                 )
                 OutlinedTextField(
-                    value = dsUrl,
-                    onValueChange = { dsUrl = it; prefs.deepSeekBaseUrl = it.trim() },
-                    label = { Text("آدرس پایهٔ دیپ‌سیک") },
-                    singleLine = true, modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = dsModel,
-                    onValueChange = { dsModel = it; prefs.deepSeekModel = it.trim() },
-                    label = { Text("مدل دیپ‌سیک") },
-                    supportingText = { Text("deepseek-chat سریع است، deepseek-reasoner کند.") },
+                    value = chatModel,
+                    onValueChange = { chatModel = it; prefs.chatModel = it.trim() },
+                    label = { Text("مدل ترجمه") },
+                    supportingText = {
+                        Text("پیش‌فرض " + Prefs.CHAT_MODEL + " — برای سرعت بیشتر llama-3.1-8b-instant")
+                    },
                     singleLine = true, modifier = Modifier.fillMaxWidth(),
                 )
             }
@@ -1618,6 +1784,11 @@ class MainActivity : ComponentActivity() {
                     style = MaterialTheme.typography.titleMedium,
                 )
             }
+            Text(
+                "پس از هر تغییر تنظیمات، یک بار توقف و شروع کنید تا اعمال شود.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
 
             if (status.isNotBlank()) {
                 Text(
@@ -1628,7 +1799,11 @@ class MainActivity : ComponentActivity() {
             }
             val e = error
             if (e != null) {
-                Text(e, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                Text(
+                    e,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
             }
             Text(
                 "نکته: نتفلیکس، اسپاتیفای و پخش‌های DRM‌دار اجازهٔ ضبط صدای داخلی نمی‌دهند. " +
@@ -1710,4 +1885,3 @@ class MainActivity : ComponentActivity() {
 EOF_MAIN
 
 echo "==> done"
-find . -name "*.kt" -o -name "*.kts" -o -name "*.xml" | sort
